@@ -1,0 +1,130 @@
+name: Poka-Yoke Fail-Closed Build Gate
+
+# Fires on every PR into main and every push, so nothing reaches a
+# deployable branch without passing every gate below.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  # -------------------------------------------------------------------------
+  # GATE 1 — Lint / format check (Poka-Yoke: blocks non-compliant code style)
+  # -------------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install lint tools
+        run: pip install flake8 black
+
+      - name: Run flake8 (Django backend)
+        run: flake8 backend/ --max-line-length=100
+
+      - name: Run black --check (formatting compliance)
+        run: black --check backend/
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run ESLint (React frontend)
+        working-directory: frontend
+        run: npx eslint src/ --max-warnings=0
+
+  # -------------------------------------------------------------------------
+  # GATE 2 — Real secret scanner (gitleaks) across full git history of the diff
+  # -------------------------------------------------------------------------
+  secret-scan-gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # gitleaks needs history to scan prior commits too
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: true
+          GITLEAKS_ENABLE_COMMENTS: true
+        # gitleaks-action exits non-zero on any finding, which fails this
+        # job automatically — no extra handling needed for the fail path.
+
+  # -------------------------------------------------------------------------
+  # GATE 3 — Lightweight custom check, as a second independent layer.
+  # Catches patterns specific to this stack (Django SECRET_KEY, GCP service
+  # account JSON keys) that a generic scanner config might not be tuned for.
+  # -------------------------------------------------------------------------
+  secret-scan-custom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Custom hardcoded-secret check
+        run: |
+          set -e
+          VIOLATIONS=0
+
+          # Django SECRET_KEY hardcoded instead of loaded from env
+          if grep -rEn "SECRET_KEY\s*=\s*['\"][A-Za-z0-9]{20,}['\"]" --include="*.py" .; then
+            echo "::error::Hardcoded Django SECRET_KEY found."
+            VIOLATIONS=1
+          fi
+
+          # Raw GCP service account private keys committed to the repo
+          if grep -rEn '"type":\s*"service_account"' --include="*.json" .; then
+            echo "::error::Raw GCP service account key file committed."
+            VIOLATIONS=1
+          fi
+
+          # Generic API key / token assignment patterns
+          if grep -rEn "(api[_-]?key|token|password)\s*=\s*['\"][A-Za-z0-9_\-]{16,}['\"]" \
+              --include="*.py" --include="*.js" --include="*.jsx" . ; then
+            echo "::error::Possible hardcoded API key/token/password found."
+            VIOLATIONS=1
+          fi
+
+          if [ "$VIOLATIONS" -eq 1 ]; then
+            echo "::error::Fail-closed gate triggered — quarantining build."
+            exit 1
+          fi
+
+  # -------------------------------------------------------------------------
+  # QUARANTINE — runs only if any gate above failed. Fails the whole check
+  # suite (blocking merge/deploy) and preserves evidence for review.
+  # -------------------------------------------------------------------------
+  quarantine-on-failure:
+    needs: [lint, secret-scan-gitleaks, secret-scan-custom]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark build as quarantined
+        run: |
+          echo "::error::One or more Poka-Yoke gates failed. Build is quarantined — merge and deploy are blocked."
+          exit 1
+
+  # -------------------------------------------------------------------------
+  # DEPLOY — only reachable if every gate above passed. This is what makes
+  # the pipeline fail-closed rather than fail-open: deploy has a hard
+  # dependency on all three gates succeeding.
+  # -------------------------------------------------------------------------
+  deploy:
+    needs: [lint, secret-scan-gitleaks, secret-scan-custom]
+    if: success() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to GCP App Engine
+        run: echo "All gates passed — proceeding with deployment (terraform apply / gcloud app deploy step goes here)."

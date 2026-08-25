@@ -31,16 +31,23 @@ jobs:
       - name: Run black --check (formatting compliance)
         run: black --check backend/
 
+      - name: Check if frontend exists
+        id: frontend_check
+        run: echo "exists=$(test -d frontend && echo true || echo false)" >> $GITHUB_OUTPUT
+
       - name: Set up Node
+        if: steps.frontend_check.outputs.exists == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Install frontend deps
+        if: steps.frontend_check.outputs.exists == 'true'
         working-directory: frontend
         run: npm ci
 
       - name: Run ESLint (React frontend)
+        if: steps.frontend_check.outputs.exists == 'true'
         working-directory: frontend
         run: npx eslint src/ --max-warnings=0
 
